@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Политех AI — Только Голограмма (Voice-only)</title>
+
+<!-- model-viewer -->
+<script type="module" src="https://unpkg.com/@google/model-viewer@4.1.0/dist/model-viewer.min.js"></script>
+
+<style>
+  :root{
+    --bg1:#020610; --bg2:#001426;
+    --accent1:#00ffd0; --accent2:#0077ff;
+    --text:#e6f0ff;
+  }
+  html,body{height:100%;margin:0;font-family:Inter, "Segoe UI", Roboto, Arial;background:
+    radial-gradient(1000px 500px at 10% 10%, rgba(0,120,255,0.04), transparent),
+    linear-gradient(180deg,var(--bg1),var(--bg2)); color:var(--text); overflow:hidden;}
+  /* grid and particles */
+  .holo-grid{position:fixed;inset:0;background-image:
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size:48px 48px,48px 48px; filter:blur(6px) saturate(1.05); mix-blend-mode:screen; opacity:0.55; z-index:0;pointer-events:none;}
+  canvas#particles{position:fixed;inset:0;z-index:0;pointer-events:none;mix-blend-mode:screen;opacity:0.9;}
+
+  /* center model only */
+  .center{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:2;pointer-events:none;
+  }
+  model-viewer{
+    width:min(52vmin,600px); height:min(52vmin,600px); border-radius:12px; background:transparent; pointer-events:none;
+    transform-style:preserve-3d;
+    filter: drop-shadow(0 20px 50px rgba(0,120,255,0.08));
+  }
+
+  /* holographic floor */
+  .holo-floor{
+    position:fixed; left:50%; transform:translateX(-50%); bottom:12vh;
+    width:min(48vmin,520px); height:min(10vmin,120px); border-radius:50%;
+    background: radial-gradient(ellipse at center, rgba(0,255,200,0.20), rgba(0,120,255,0.06) 45%, transparent 60%);
+    filter:blur(12px); z-index:1; pointer-events:none; animation: pulse 1400ms ease-in-out infinite;
+  }
+  @keyframes pulse {0%{transform:translateX(-50%) scale(1);opacity:0.6}50%{transform:translateX(-50%) scale(1.14);opacity:1}100%{transform:translateX(-50%) scale(1);opacity:0.6}}
+
+  /* completely minimal: hidden accessibility hint (not visible) */
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+</style>
+</head>
+<body>
+
+<div class="holo-grid" aria-hidden="true"></div>
+<canvas id="particles" aria-hidden="true"></canvas>
+
+<div class="center" aria-hidden="false">
+  <model-viewer id="avatar"
+    src="https://threejs.org/examples/models/gltf/RobotExpressive/RobotExpressive.glb"
+    alt="3D Holographic Assistant"
+    auto-rotate
+    camera-controls
+    animation-name="Armature|Idle"
+    shadow-intensity="0.6"
+    exposure="1">
+  </model-viewer>
+</div>
+
+<div class="holo-floor" aria-hidden="true"></div>
+
+<!-- invisible aria text for screen readers only -->
+<div class="sr-only" id="sr">Политех AI: голосовой голографический помощник. Слушает и отвечает голосом.</div>
+
+<script>
+/*
+  Полностью "voice-only" режим:
+  - Авто-запуск распознавания при загрузке (попытка).
+  - Нет текстового чата и нет кнопок UI.
+  - Ассистент отвечает только голосом (TTS).
+  - Сохраняется локальный FAQ; можно подключить HF endpoint (HF_API_URL).
+*/
+
+/* --- Настройки --- */
+const HF_API_URL = ""; // при необходимости вставь endpoint HuggingFace (не публикуй токен)
+const AUTO_START = true; // пытаемся стартовать сразу при загрузке
+const RESTART_ON_END = true; // перезапуск recognition при неожиданном окончании
+const languageAuto = (navigator.language || navigator.userLanguage || 'ru').toLowerCase();
+const defaultLang = languageAuto.startsWith('kk') || languageAuto.startsWith('kz') ? 'kk' : 'ru';
+
+/* --- Строки --- */
+const STR = {
+  ru: { listening: "Слушаю...", thinking: "Думаю...", fallback: "Извини, не понял. Спроси короче." },
+  kk: { listening: "Тыңдап тұрмын...", thinking: "Ойлануда...", fallback: "Кешіріңіз, түсінбедім." }
+};
+
+/* --- FAQ (локальные ответы) --- */
+const FAQ = {
+  ru: {
+    "что такое политех": "Политех — университет, готовящий инженеров и специалистов.",
+    "где столовая": "Столовая в корпусе А, первый этаж. Работает примерно с 8 до 18.",
+    "когда пара": "Проверь электронное расписание в личном кабинете."
+  },
+  kk: {
+    "политех деген не": "Политех — инженерлер даярлайтын университет.",
+    "асхана қайда": "Асхана A корпусында, бірінші қабат. 8:00-18:00 аралығында ашық.",
+    "қашан дәріс": "Электронды кестені өзіңнің порталдан тексеріңіз."
+  }
+};
+
+/* --- helper: normalize --- */
+function normalize(text){
+  return text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu,'').trim();
+}
+
+/* --- find FAQ answer (simple fuzzy by keyword overlap) --- */
+function findAnswer(lang, text){
+  const dict = FAQ[lang] || {};
+  const normalized = normalize(text);
+  if(dict[normalized]) return dict[normalized];
+  const words = normalized.split(/\s+/).filter(Boolean);
+  let best = {score:0, ans:null};
+  for(const q in dict){
+    const qw = q.split(/\s+/);
+    let score = 0;
+    for(const w of words) if(qw.includes(w)) score++;
+    if(score > best.score){ best.score = score; best.ans = dict[q]; }
+  }
+  if(best.score >= 1) return best.ans;
+  return null;
+}
+
+/* --- HF fallback --- */
+async function hfReply(prompt){
+  if(!HF_API_URL) return null;
+  try{
+    const res = await fetch(HF_API_URL, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' /*, 'Authorization':'Bearer <TOKEN>' */ },
+      body: JSON.stringify({ inputs: prompt })
+    });
+    if(!res.ok) return null;
+    const data = await res.json();
+    if(Array.isArray(data) && data[0]) return data[0].generated_text || null;
+    if(data.generated_text) return data.generated_text;
+    return JSON.stringify(data);
+  }catch(e){
+    console.warn('HF error', e);
+    return null;
+  }
+}
+
+/* --- TTS --- */
+function speak(text, lang){
+  try{
+    if(!window.speechSynthesis) return;
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = lang === 'kk' ? 'kk-KZ' : 'ru-RU';
+    u.pitch = 1.03;
+    u.rate = 1;
+    // animate model as "talk"
+    try { avatar.animationName = 'Armature|Talk'; } catch(e){}
+    u.onend = ()=>{ try { avatar.animationName = 'Armature|Idle'; } catch(e){} };
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  } catch(e){ console.warn('TTS error', e); }
+}
+
+/* --- Model animation helpers (safety: fallback CSS transforms if animationName not supported) --- */
+const avatar = document.getElementById('avatar');
+
+function playAnim(name, fallback){
+  try{
+    avatar.animationName = name;
+    if(name !== 'Armature|Idle'){
+      setTimeout(()=>{ try{ avatar.animationName = 'Armature|Idle'; } catch(e){} }, 2000);
+    }
+  }catch(e){
+    if(typeof fallback === 'function') fallback();
+  }
+}
+
+function headNod(){
+  playAnim('Armature|Talk', ()=>{
+    avatar.style.transition = 'transform 220ms ease';
+    avatar.style.transform = 'rotateX(8deg)';
+    setTimeout(()=>{ avatar.style.transform = 'rotateX(-6deg)'; }, 220);
+    setTimeout(()=>{ avatar.style.transform = ''; }, 520);
+  });
+}
+
+/* --- Process recognized speech: only voice — no UI text output --- */
+async function processRecognized(text, lang){
+  // determine lang if not provided
+  const activeLang = lang || defaultLang;
+  // try local FAQ
+  let answer = findAnswer(activeLang, text);
+  // fallback to HF if available
+  if(!answer && HF_API_URL){
+    answer = await hfReply(text);
+  }
+  if(!answer) answer = (activeLang === 'kk') ? STR.kk.fallback : STR.ru.fallback;
+  // speak and animate
+  headNod();
+  speak(answer, activeLang);
+}
+
+/* --- SpeechRecognition setup (continuous) --- */
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+if(SpeechRecognition){
+  recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = false;
+  recognition.lang = defaultLang === 'kk' ? 'kk-KZ' : 'ru-RU';
+
+  recognition.onresult = (ev) => {
+    for(let i = ev.resultIndex; i < ev.results.length; i++){
+      if(ev.results[i].isFinal){
+        const txt = ev.results[i][0].transcript.trim();
+        if(txt.length){
+          // process recognized text (voice-only)
+          processRecognized(txt, defaultLang);
+        }
+      }
+    }
+  };
+
+  recognition.onerror = (e) => {
+    console.warn('recognition error', e);
+    // do not show UI; try graceful stop
+    try{ recognition.stop(); }catch(_){}
+  };
+
+  recognition.onend = () => {
+    // auto-restart for persistent listening (if allowed)
+    if(RESTART_ON_END){
+      try{ recognition.start(); }catch(e){ console.warn('restart blocked', e); }
+    }
+  };
+}
+
+/* --- Attempt auto-start on load --- */
+async function tryAutoStart(){
+  if(!recognition){
+    console.warn('SpeechRecognition not supported in this browser.');
+    return;
+  }
+  try {
+    // try to get microphone permission proactively (some browsers require getUserMedia)
+    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // release stream (we only requested permission)
+        stream.getTracks().forEach(t => t.stop());
+      } catch(err){
+        // user denied or browser blocked; recognition.start() will also trigger permission prompt
+        console.warn('getUserMedia failed or denied', err);
+      }
+    }
+    recognition.lang = defaultLang === 'kk' ? 'kk-KZ' : 'ru-RU';
+    recognition.start();
+  } catch (e) {
+    console.warn('Auto-start recognition blocked:', e);
+    // cannot show UI per user's request — log to console.
+  }
+}
+
+/* start immediately if allowed */
+if(AUTO_START){
+  // try without waiting
+  tryAutoStart();
+}
+
+/* --- small invisible safety: if page is interacted, ensure recognition running (no visible controls) --- */
+window.addEventListener('click', () => {
+  // user gesture: if recognition exists and not listening, start it
+  try {
+    if(recognition && !recognition._started){
+      recognition.start();
+    }
+  } catch(e){ try{ recognition.start(); }catch(_){ } }
+});
+
+/* --- simple particle background (visual only) --- */
+(function particles(){
+  const canvas = document.getElementById('particles');
+  if(!canvas) return;
+  const ctx = canvas.getContext('2d');
+  let w=0,h=0,parts=[];
+  function resize(){ w=canvas.width=innerWidth; h=canvas.height=innerHeight; init(); }
+  function init(){
+    parts=[]; const count = Math.min(140, Math.floor((w*h)/90000));
+    for(let i=0;i<count;i++) parts.push({
+      x: Math.random()*w, y: Math.random()*h,
+      r: 0.6 + Math.random()*2.4,
+      vx: (Math.random()-0.5)*0.3, vy: -0.1 - Math.random()*0.4,
+      life: Math.random()*400 + 100
+    });
+  }
+  function step(){
+    ctx.clearRect(0,0,w,h);
+    for(const p of parts){
+      p.x += p.vx; p.y += p.vy; p.life--;
+      if(p.life<0 || p.y < -20 || p.x < -20 || p.x > w+20){ p.x=Math.random()*w; p.y=h+20; p.life=Math.random()*400+100; }
+      const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r*10);
+      g.addColorStop(0, 'rgba(0,255,200,0.12)'); g.addColorStop(0.3, 'rgba(0,120,255,0.06)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x,p.y,p.r*10,0,Math.PI*2); ctx.fill();
+    }
+    requestAnimationFrame(step);
+  }
+  addEventListener('resize', resize);
+  resize();
+  step();
+})();
+</script>
+</body>
+</html>
